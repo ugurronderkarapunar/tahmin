@@ -7,7 +7,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import RobustScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, mean_absolute_percentage_error
 from lightgbm import LGBMRegressor
 
 # Page Configuration
@@ -34,7 +34,7 @@ def train_and_optimize_model():
     1. Sentetik veriyi üretir.
     2. Ön işleme pipeline'ını kurar.
     3. RandomizedSearchCV (5-Fold CV) ile MAE skorunu en minimize eden hiperparametreleri bulur.
-    4. En iyi modeli (best_estimator_) döndürür.
+    4. Model performans metriklerini (MAE, MAPE, R²) hesaplayıp döndürür.
     """
     np.random.seed(42)
     n_samples = 600
@@ -90,7 +90,7 @@ def train_and_optimize_model():
         ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
 
-    # Hiperparametre Dağılımı (MAE Odaklı)
+    # Hiperparametre Arama
     param_distributions = {
         'model__n_estimators': [100, 200, 300],
         'model__learning_rate': [0.01, 0.05, 0.1],
@@ -105,7 +105,6 @@ def train_and_optimize_model():
     X_train, X_test, y_train, y_test = train_test_split(X_fe, y, test_size=0.2, random_state=42)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    # MAE Skoruna Göre Hiperparametre Arama
     search = RandomizedSearchCV(
         estimator=base_pipeline,
         param_distributions=param_distributions,
@@ -120,24 +119,23 @@ def train_and_optimize_model():
     search.fit(X_train, y_train)
 
     best_pipeline = search.best_estimator_
-    best_cv_mae = -search.best_score_
-    best_params = search.best_params_
 
-    # Test Kümesi Performansı
+    # Test Kümesi Üzerinde Hata Oranlarının Hesaplanması
     y_pred_test = best_pipeline.predict(X_test)
     test_mae = mean_absolute_error(y_test, y_pred_test)
+    test_mape = mean_absolute_percentage_error(y_test, y_pred_test) * 100
     test_r2 = r2_score(y_test, y_pred_test)
 
-    return best_pipeline, best_cv_mae, test_mae, test_r2, best_params
+    return best_pipeline, test_mae, test_mape, test_r2
 
-# En iyi modeli oluştur ve önbelleğe al
-best_model, best_cv_mae, test_mae, test_r2, best_params = train_and_optimize_model()
+# Modeli ve metrikleri yükle
+best_model, test_mae, test_mape, test_r2 = train_and_optimize_model()
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ (SERBEST SAYISAL GİRDİ ALANLARI)
+# 2. STREAMLIT ARAYÜZÜ (HATA GERİ BİLDİRİMLİ)
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("5-Fold CV & MAE Hiperparametre Optimizasyonu Yapılmış En İyi Model")
+st.caption("5-Fold CV ile MAE Bazlı Optimize Edilmiş LightGBM Modeli")
 
 st.divider()
 
@@ -146,44 +144,15 @@ col_input, col_result = st.columns([1, 1], gap="large")
 with col_input:
     st.subheader("📋 Ev Özelliklerini Giriniz")
     
-    # Herhangi bir sayısal değer girilebilen serbest input alanları
-    area = st.number_input(
-        "Metrekare / Alan (sqft)", 
-        min_value=1.0, 
-        value=3500.0, 
-        step=50.0,
-        help="İstediğiniz herhangi bir metrekare değerini elle yazabilirsiniz."
-    )
+    area = st.number_input("Metrekare / Alan (sqft)", min_value=1.0, value=3500.0, step=50.0)
     
     col_a, col_b = st.columns(2)
     with col_a:
-        bedrooms = st.number_input(
-            "Yatak Odası Sayısı", 
-            min_value=0, 
-            value=3, 
-            step=1,
-            help="İstediğiniz oda sayısını giriniz."
-        )
-        stories = st.number_input(
-            "Kat Sayısı", 
-            min_value=0, 
-            value=2, 
-            step=1,
-            help="İstediğiniz kat sayısını giriniz."
-        )
+        bedrooms = st.number_input("Yatak Odası Sayısı", min_value=0, value=3, step=1)
+        stories = st.number_input("Kat Sayısı", min_value=0, value=2, step=1)
     with col_b:
-        bathrooms = st.number_input(
-            "Banyo Sayısı", 
-            min_value=0, 
-            value=2, 
-            step=1,
-            help="İstediğiniz banyo sayısını giriniz."
-        )
-        furnishingstatus = st.selectbox(
-            "Eşya Durumu", 
-            options=['furnished', 'semi-furnished', 'unfurnished'], 
-            index=1
-        )
+        bathrooms = st.number_input("Banyo Sayısı", min_value=0, value=2, step=1)
+        furnishingstatus = st.selectbox("Eşya Durumu", options=['furnished', 'semi-furnished', 'unfurnished'], index=1)
 
     col_c, col_d = st.columns(2)
     with col_c:
@@ -194,7 +163,7 @@ with col_input:
     predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
 with col_result:
-    st.subheader("📊 Tahmin ve Model Performansı")
+    st.subheader("📊 Tahmin Sonucu ve Model Hata Analizi")
     
     if predict_btn:
         raw_input = pd.DataFrame([{
@@ -207,27 +176,38 @@ with col_result:
             'furnishingstatus': furnishingstatus
         }])
         
-        # Otomatik Feature Engineering
         processed_input = create_features(raw_input)
-        
-        # En iyi model ile tahmin alma
         pred_price = best_model.predict(processed_input)[0]
         
-        st.success("Tahmin Başarıyla Hesaplandı!")
+        # Tahmin Aralığı Hesaplama (Nokta Tahmin ± Ortalama Hata)
+        lower_bound = max(0, pred_price - test_mae)
+        upper_bound = pred_price + test_mae
+
+        st.success("Tahmin Başarıyla Üretildi!")
+        
+        # Nokta Tahmin Gösterimi
         st.metric(
-            label="En İyi Modelin Tahmin Ettiği Ev Fiyatı",
+            label="Tahmini Piyasa Değeri",
             value=f"{pred_price:,.2f} TL"
         )
-        
-        st.divider()
-        st.markdown("### 🎯 Optimizasyon Metrikleri")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("En İyi CV MAE", f"±{best_cv_mae:,.0f} TL")
-        m2.metric("Test MAE", f"±{test_mae:,.0f} TL")
-        m3.metric("Test R²", f"%{test_r2 * 100:.1f}")
 
-        with st.expander("🛠️ Seçilen En İyi Hiperparametreler (Best Parameters)"):
-            clean_params = {k.replace('model__', ''): v for k, v in best_params.items()}
-            st.json(clean_params)
+        # Kullanıcıya Özel Hata Oranı Bildirimi
+        st.warning(
+            f"📢 **Model Güvenilirlik & Hata Bildirimi:**\n\n"
+            f"- Bu model test verileri üzerinde **%{test_mape:.2f} ortalama hata oranı** ile çalışmaktadır.\n"
+            f"- Yapılan tahminlerde ortalama sapma miktarı **±{test_mae:,.2f} TL**'dir.\n"
+            f"- **Olası Fiyat Aralığı:** `{lower_bound:,.0f} TL` — `{upper_bound:,.0f} TL`"
+        )
+
+        st.divider()
+
+        # Detaylı Performans Metrikleri
+        m1, m2 = st.columns(2)
+        m1.metric("Model Yüzdesel Hatalılık (MAPE)", f"%{test_mape:.2f}")
+        m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
+
     else:
-        st.info("İstediğiniz sayısal değerleri girip **'Fiyatı Tahmin Et'** butonuna basarak anlık tahmin alabilirsiniz.")
+        st.info(
+            f"ℹ️ **Sistem Bilgisi:** Eğitilen model test verilerinde ortalama **%{test_mape:.2f}** hata payına sahiptir.\n\n"
+            "Tahmin almak için soldaki form alanlarını doldurup **'Fiyatı Tahmin Et'** butonuna basınız."
+        )
