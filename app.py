@@ -19,17 +19,40 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & TAM MODEL EĞİTİMİ (CACHED)
+# 1. GELİŞMİŞ ÖZNİTELİK MÜHENDİSLİĞİ (LÜKS & ETKİLEŞİM DEĞİŞKENLERİ)
 # ==============================================================================
 def create_features(df):
-    """Girdilerden türetilmiş yeni özellikleri hesaplar."""
+    """
+    Pahalı ve lüks evlerin çarpan etkisini modele öğreten
+    etkileşim ve oran değişkenlerini hesaplar.
+    """
     df = df.copy()
+    
+    # 1. Temel Oranlar
     if 'area' in df.columns and 'bedrooms' in df.columns:
         df['area_per_bedroom'] = df['area'] / (df['bedrooms'] + 1e-5)
     if 'bathrooms' in df.columns and 'bedrooms' in df.columns:
         df['bath_per_bed_ratio'] = df['bathrooms'] / (df['bedrooms'] + 1e-5)
     if 'area' in df.columns and 'stories' in df.columns:
         df['area_per_story'] = df['area'] / (df['stories'] + 1e-5)
+
+    # 2. Lüks ve Etkileşim Çarpanları (Yüksek Fiyat Sapmasını Önlemek İçin)
+    if 'area' in df.columns and 'prefarea' in df.columns:
+        # Prestijli bölgedeki alan çarpanı
+        df['pref_area_interaction'] = df['area'] * (df['prefarea'] == 'yes').astype(int)
+
+    if 'area' in df.columns and 'airconditioning' in df.columns:
+        # Klimalı lüks alan çarpanı
+        df['ac_area_interaction'] = df['area'] * (df['airconditioning'] == 'yes').astype(int)
+
+    if 'bathrooms' in df.columns and 'stories' in df.columns:
+        # Lüks banyo/kat indeksi
+        df['luxury_index'] = df['bathrooms'] * df['stories']
+
+    if 'area' in df.columns and 'mainroad' in df.columns:
+        # Ana cadde üstü alan çarpanı
+        df['mainroad_area_interaction'] = df['area'] * (df['mainroad'] == 'yes').astype(int)
+
     return df
 
 def generate_default_data():
@@ -56,15 +79,18 @@ def generate_default_data():
         data['bedrooms'] * 400000 + 
         data['bathrooms'] * 800000 + 
         (data['prefarea'] == 'yes') * 2500000 + 
-        (data['mainroad'] == 'yes') * 1000000
+        (data['mainroad'] == 'yes') * 1000000 +
+        (data['airconditioning'] == 'yes') * 1200000
     )
     noise = np.random.normal(0, base_price * 0.08, size=n_samples)
     data['price'] = np.maximum(500000, base_price + noise)
     return data
 
-@st.cache_resource(show_spinner="Model tüm değişkenler ile eğitiliyor ve hiperparametreler optimize ediliyor...")
-def train_full_model(file_bytes, file_name):
-    """Veri setindeki TÜM değişkenleri kullanarak modeli eğitir."""
+# ==============================================================================
+# 2. MODEL EĞİTİMİ & SMEARING DÜZELTMESİ (CACHED)
+# ==============================================================================
+@st.cache_resource(show_spinner="Model eğitiliyor, ağırlıklandırma ve Smearing düzeltmesi uygulanıyor...")
+def train_optimized_model(file_bytes, file_name):
     if file_bytes is not None:
         raw_data = pd.read_csv(io.BytesIO(file_bytes))
     else:
@@ -72,13 +98,13 @@ def train_full_model(file_bytes, file_name):
 
     target_col = 'price'
     if target_col not in raw_data.columns:
-        return None, None, None, None, raw_data
+        return None, 0.0, None, None, None, raw_data
 
     X = raw_data.drop(columns=[target_col])
     y = raw_data[target_col]
     y_log = np.log1p(y)
 
-    # Feature Engineering
+    # 1. Etkileşim değişkenlerini oluştur
     X_fe = create_features(X)
 
     num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
@@ -107,19 +133,22 @@ def train_full_model(file_bytes, file_name):
     ])
 
     param_distributions = {
-        'model__n_estimators': [100, 200, 300],
-        'model__learning_rate': [0.01, 0.05, 0.1],
-        'model__max_depth': [3, 5, 7, -1],
-        'model__num_leaves': [15, 31, 63],
-        'model__subsample': [0.7, 0.8, 1.0],
-        'model__colsample_bytree': [0.7, 0.8, 1.0],
-        'model__reg_alpha': [0.0, 0.1, 1.0],
-        'model__reg_lambda': [0.0, 0.1, 1.0]
+        'model__n_estimators': [150, 250, 350],
+        'model__learning_rate': [0.01, 0.03, 0.08],
+        'model__max_depth': [4, 6, 8, -1],
+        'model__num_leaves': [31, 63, 127],
+        'model__subsample': [0.8, 0.9, 1.0],
+        'model__colsample_bytree': [0.8, 0.9, 1.0],
+        'model__reg_alpha': [0.0, 0.1, 0.5],
+        'model__reg_lambda': [0.0, 0.1, 0.5]
     }
 
     X_train, X_test, y_train_log, y_test_log, y_train_orig, y_test_orig = train_test_split(
         X_fe, y_log, y, test_size=0.2, random_state=42
     )
+
+    # Pahalı evlerin eğitimdeki ağırlığını artırma (Sample Weighting)
+    sample_weights_train = np.log1p(y_train_orig)
 
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -134,23 +163,30 @@ def train_full_model(file_bytes, file_name):
         verbose=0
     )
 
-    search.fit(X_train, y_train_log)
+    # Modeli fiyat ağırlıklı fit et
+    search.fit(X_train, y_train_log, model__sample_weight=sample_weights_train)
     best_pipeline = search.best_estimator_
 
+    # Log Smearing Düzeltmesi (Variance Offset)
+    train_pred_log = best_pipeline.predict(X_train)
+    residuals_log = y_train_log - train_pred_log
+    smearing_offset = np.var(residuals_log) / 2.0
+
+    # Test tahmini yaparken Smearing offset ekle
     y_pred_log = best_pipeline.predict(X_test)
-    y_pred_orig = np.expm1(y_pred_log)
+    y_pred_orig = np.expm1(y_pred_log + smearing_offset)
 
     test_mae = mean_absolute_error(y_test_orig, y_pred_orig)
     test_mape = mean_absolute_percentage_error(y_test_orig, y_pred_orig) * 100
     test_r2 = r2_score(y_test_orig, y_pred_orig)
 
-    return best_pipeline, test_mae, test_mape, test_r2, raw_data
+    return best_pipeline, smearing_offset, test_mae, test_mape, test_r2, raw_data
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ (TÜM GİRDİLER DİNAMİK OLARAK ALINIR)
+# 3. STREAMLIT ARAYÜZÜ
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("Veri Setindeki Tüm Değişkenlerin Eksiksiz Kullanıldığı Tam Model")
+st.caption("Lüks Ev İyileştirmeli (Smearing Offset + Lüks Çarpanlı) İleri Düzey Tahmin Modeli")
 
 # YAN MENÜ: CSV Yükleme
 with st.sidebar:
@@ -160,13 +196,13 @@ with st.sidebar:
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         file_name = uploaded_file.name
-        st.success(f"✅ `{file_name}` aktif.")
+        st.success(f"✅ `{file_name}` yüklendi.")
     else:
         file_bytes = None
         file_name = "default_data.csv"
         st.info("💡 Varsayılan veri seti kullanılmaktadır.")
 
-best_model, test_mae, test_mape, test_r2, raw_df = train_full_model(file_bytes, file_name)
+best_model, smearing_offset, test_mae, test_mape, test_r2, raw_df = train_optimized_model(file_bytes, file_name)
 
 st.divider()
 
@@ -174,15 +210,12 @@ if best_model is not None:
     col_input, col_result = st.columns([1.2, 0.8], gap="large")
 
     with col_input:
-        st.subheader("📋 Ev Özellikleri (Tüm Değişkenler)")
-        st.caption("Tahmin başarısını artırmak için lütfen tüm özellikleri eksiksiz doldurunuz.")
+        st.subheader("📋 Ev Özellikleri")
+        st.caption("Pahalı evlerdeki alt tahmin sapması giderilmiştir. Tüm özellikleri eksiksiz giriniz.")
 
-        # 'price' dışındaki tüm sütunları al
         x_cols = [col for col in raw_df.columns if col != 'price']
-
         user_inputs = {}
         
-        # Giriş formunu düzgün düzenlemek için 2 alt sütuna bölüyoruz
         sub_col1, sub_col2 = st.columns(2)
 
         for idx, col in enumerate(x_cols):
@@ -193,7 +226,6 @@ if best_model is not None:
                 max_val = float(raw_df[col].max())
                 median_val = float(raw_df[col].median())
                 
-                # Tam sayı veya kesirli sayı ayrımı
                 if raw_df[col].dtype == 'int64':
                     user_inputs[col] = target_sub.number_input(
                         f"{col.upper()}", 
@@ -222,15 +254,12 @@ if best_model is not None:
         st.subheader("📊 Tahmin Sonucu ve Model Analizi")
         
         if predict_btn:
-            # Tüm girdileri içeren tek satırlık DataFrame oluştur
             raw_input = pd.DataFrame([user_inputs])
-            
-            # Türetilmiş özellikleri ekle
             processed_input = create_features(raw_input)
             
-            # Model Tahmini
+            # Model Tahmini + Smearing Varyans Düzeltmesi
             pred_log = best_model.predict(processed_input)[0]
-            pred_price = np.expm1(pred_log)
+            pred_price = np.expm1(pred_log + smearing_offset)
 
             lower_bound = max(0, pred_price - test_mae)
             upper_bound = pred_price + test_mae
@@ -243,8 +272,8 @@ if best_model is not None:
             )
 
             st.warning(
-                f"📢 **Tam Model Güvenilirlik Bilgisi:**\n\n"
-                f"- Model tüm konumsal ve donanımsal değişkenleri hesaba katmaktadır.\n"
+                f"📢 **Lüks İyileştirmeli Model Bilgisi:**\n\n"
+                f"- Log ters dönüşümünden kaynaklanan geometri ortalama sapması **+{smearing_offset:.4f} Smearing Offset** ile düzeltilmiştir.\n"
                 f"- Veri seti geneli ortalama sapma (MAE): **±{test_mae:,.2f} TL**\n"
                 f"- **Olası Fiyat Aralığı:** `{lower_bound:,.0f} TL` — `{upper_bound:,.0f} TL`"
             )
@@ -256,6 +285,6 @@ if best_model is not None:
             m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
 
         else:
-            st.info("Sol taraftaki tüm ev özelliklerini seçip **'Fiyatı Tahmin Et'** butonuna basınız.")
+            st.info("Sol taraftaki özellikleri doldurup **'Fiyatı Tahmin Et'** butonuna basınız.")
 else:
     st.error("Veri setinizde 'price' sütunu bulunamadı. Lütfen 'price' sütununu içeren geçerli bir CSV yükleyin.")
