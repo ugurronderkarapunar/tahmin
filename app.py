@@ -22,7 +22,20 @@ st.set_page_config(page_title="Ev Fiyat Tahmini", layout="wide")
 def load_data(uploaded_file):
     if uploaded_file is not None:
         return pd.read_csv(uploaded_file)
-    return pd.read_csv("Housing.csv")
+    if os.path.exists("Housing.csv"):
+        return pd.read_csv("Housing.csv")
+    return None
+
+
+@st.cache_resource
+def load_saved_model():
+    if os.path.exists("model.pkl"):
+        try:
+            return joblib.load("model.pkl")
+        except Exception as e:
+            st.error(f"Model yüklenirken sürüm hatası oluştu: {e}")
+            return None
+    return None
 
 
 @st.cache_resource
@@ -82,15 +95,15 @@ def train_all_models(X_train, y_train_model, X_test, y_test_model):
 # SIDEBAR
 st.sidebar.title("Ev Fiyat Tahmini")
 uploaded = st.sidebar.file_uploader(
-    "Housing.csv yükle (opsiyonel — EDA ve Model Karşılaştırma için)",
+    "Housing.csv yükle (opsiyonel — Analiz ve Model Karşılaştırma için)",
     type="csv",
 )
 
-data_available = uploaded is not None or os.path.exists("Housing.csv")
+df = load_data(uploaded)
+data_available = df is not None
 
 X_train = X_test = y_train = y_test = y_train_model = y_test_model = None
 if data_available:
-    df = load_data(uploaded)
     X = df.drop(columns=["price"])
     y = df["price"]
     X_train, X_test, y_train, y_test = train_test_split(
@@ -98,22 +111,14 @@ if data_available:
     )
     y_train_model, y_test_model = np.log1p(y_train), np.log1p(y_test)
 
-model_available = os.path.exists("model.pkl")
-
-
-@st.cache_resource
-def load_saved_model():
-    return joblib.load("model.pkl")
-
-
 tab1, tab2, tab3, tab4 = st.tabs(
     ["📊 Keşifçi Analiz", "🤖 Model Karşılaştırma", "📈 Hata Analizi", "🔮 Tahmin"]
 )
 
-# TAB 1
+# TAB 1 - Keşifçi Analiz
 with tab1:
     if not data_available:
-        st.info("Bu sekme için Housing.csv dosyasının yüklenmesi gerekir.")
+        st.info("Keşifçi analiz grafiklerini görmek için sol menüden `Housing.csv` yükleyebilirsiniz.")
     else:
         st.subheader("Hedef Değişken (Price) Dağılımı")
         col1, col2 = st.columns(2)
@@ -132,9 +137,7 @@ with tab1:
             st.pyplot(fig)
 
         st.subheader("Sayısal Değişken - Fiyat Korelasyonu")
-        num_cols_raw = X_train.select_dtypes(
-            include=[np.number]
-        ).columns.tolist()
+        num_cols_raw = X_train.select_dtypes(include=[np.number]).columns.tolist()
         corr = (
             pd.concat([X_train[num_cols_raw], y_train], axis=1)
             .corr()["price"]
@@ -155,9 +158,7 @@ with tab1:
         cat_cols_raw = X_train.select_dtypes(include=["object"]).columns.tolist()
         selected_cat = st.selectbox("İncelenecek kategorik değişken", cat_cols_raw)
 
-        temp = pd.DataFrame(
-            {"feature": X_train[selected_cat], "target": y_train}
-        )
+        temp = pd.DataFrame({"feature": X_train[selected_cat], "target": y_train})
         groups = [g["target"].values for _, g in temp.groupby("feature")]
         f_stat, p_val = stats.f_oneway(*groups)
 
@@ -179,10 +180,10 @@ with tab1:
         ax.set_title(f"{selected_cat} - Price (ANOVA p={p_val:.4f})")
         st.pyplot(fig)
 
-# TAB 2
+# TAB 2 - Model Karşılaştırma
 with tab2:
     if not data_available:
-        st.info("Bu sekme için Housing.csv dosyasının yüklenmesi gerekir.")
+        st.info("Modelleri karşılaştırmak için sol menüden `Housing.csv` yükleyebilirsiniz.")
     else:
         st.subheader("Model Karşılaştırma (5-Fold CV, log-hedef üzerinde MAE)")
         with st.spinner("Modeller eğitiliyor..."):
@@ -193,22 +194,16 @@ with tab2:
         st.success(f"En iyi model (en düşük CV Val MAE): **{best_name}**")
 
         best_pipeline = fitted_pipelines[best_name]
-        if hasattr(
-            best_pipeline.named_steps["model"], "feature_importances_"
-        ):
+        if hasattr(best_pipeline.named_steps["model"], "feature_importances_"):
             st.subheader("Feature Importance")
             feature_names = (
                 best_pipeline.named_steps["prep"]
                 .named_steps["preprocessor"]
                 .get_feature_names_out()
             )
-            importances = best_pipeline.named_steps[
-                "model"
-            ].feature_importances_
+            importances = best_pipeline.named_steps["model"].feature_importances_
             imp_df = (
-                pd.DataFrame(
-                    {"Feature": feature_names, "Importance": importances}
-                )
+                pd.DataFrame({"Feature": feature_names, "Importance": importances})
                 .sort_values("Importance", ascending=False)
                 .head(10)
             )
@@ -223,10 +218,10 @@ with tab2:
             )
             st.pyplot(fig)
 
-# TAB 3
+# TAB 3 - Hata Analizi
 with tab3:
     if not data_available:
-        st.info("Bu sekme için Housing.csv dosyasının yüklenmesi gerekir.")
+        st.info("Hata analizi yapmak için sol menüden `Housing.csv` yükleyebilirsiniz.")
     else:
         st.subheader("Test Kümesi Final Değerlendirme")
         with st.spinner("Hesaplanıyor..."):
@@ -250,14 +245,8 @@ with tab3:
         col1, col2 = st.columns(2)
         with col1:
             fig, ax = plt.subplots()
-            sns.scatterplot(
-                x=y_test, y=y_pred, alpha=0.6, ax=ax, color="indigo"
-            )
-            ax.plot(
-                [y_test.min(), y_test.max()],
-                [y_test.min(), y_test.max()],
-                "r--",
-            )
+            sns.scatterplot(x=y_test, y=y_pred, alpha=0.6, ax=ax, color="indigo")
+            ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], "r--")
             ax.set_xlabel("Gerçek")
             ax.set_ylabel("Tahmin")
             ax.set_title("Gerçek vs Tahmin")
@@ -266,36 +255,32 @@ with tab3:
         with col2:
             residuals = y_test - y_pred
             fig, ax = plt.subplots()
-            sns.scatterplot(
-                x=y_test, y=residuals, alpha=0.6, ax=ax, color="darkred"
-            )
+            sns.scatterplot(x=y_test, y=residuals, alpha=0.6, ax=ax, color="darkred")
             ax.axhline(0, color="black", linestyle="--")
             ax.set_xlabel("Gerçek Fiyat")
             ax.set_ylabel("Hata")
             ax.set_title("Fiyata Göre Hata")
             st.pyplot(fig)
 
-# TAB 4
+# TAB 4 - SADECE MODEL.PKL İLE ÇALIŞAN TAHMİN SEKMESİ
 with tab4:
     st.subheader("Yeni Bir Ev İçin Fiyat Tahmini")
 
-    active_pipeline = None
-    if model_available:
-        active_pipeline = load_saved_model()
-        st.caption("Kullanılan model: model.pkl")
-    elif data_available:
-        with st.spinner("Kayıtlı model yüklenemedi, veriden anlık eğitiliyor..."):
+    active_pipeline = load_saved_model()
+
+    if active_pipeline is None and data_available:
+        with st.spinner("model.pkl bulunamadı, yüklenen veriden model eğitiliyor..."):
             _, fitted_pipelines, best_name = train_all_models(
                 X_train, y_train_model, X_test, y_test_model
             )
-        active_pipeline = fitted_pipelines[best_name]
-        st.caption(f"Kullanılan model: {best_name} (anlık)")
-    else:
-        st.warning(
-            "Model dosyası (`model.pkl`) veya veri kümesi (`Housing.csv`) bulunamadı."
-        )
+            active_pipeline = fitted_pipelines[best_name]
 
-    if active_pipeline is not None:
+    if active_pipeline is None:
+        st.error(
+            "Tahmin yapabilmek için `model.pkl` dosyasının dizinde bulunması gerekir. "
+            "Lütfen `python train_and_save.py` çalıştırarak modeli oluşturun."
+        )
+    else:
         c1, c2, c3 = st.columns(3)
         with c1:
             area = st.number_input(
@@ -304,16 +289,12 @@ with tab4:
             bedrooms = st.number_input(
                 "Yatak Odası", min_value=1, max_value=10, value=3
             )
-            bathrooms = st.number_input(
-                "Banyo", min_value=1, max_value=5, value=2
-            )
+            bathrooms = st.number_input("Banyo", min_value=1, max_value=5, value=2)
         with c2:
             stories = st.number_input(
                 "Kat Sayısı", min_value=1, max_value=5, value=2
             )
-            parking = st.number_input(
-                "Otopark", min_value=0, max_value=5, value=1
-            )
+            parking = st.number_input("Otopark", min_value=0, max_value=5, value=1)
             furnishingstatus = st.selectbox("Eşya Durumu", FURNISHING_ORDER)
         with c3:
             mainroad = st.selectbox("Ana Yola Yakın", ["yes", "no"])
