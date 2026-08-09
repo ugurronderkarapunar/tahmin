@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & TEK SEFERLİK EĞİTİM (CACHED)
+# 1. YARDIMCI FONKSİYONLAR & 2 AŞAMALI MODEL EĞİTİMİ (CACHED)
 # ==============================================================================
 def create_features(df):
     """Girdilerden türetilmiş yeni özellikleri hesaplar."""
@@ -62,29 +62,8 @@ def generate_default_data():
     data['price'] = np.maximum(500000, base_price + noise)
     return data
 
-@st.cache_resource(show_spinner="Model eğitiliyor ve Feature Importance hesaplanıyor...")
-def train_model_cached(file_bytes, file_name):
-    if file_bytes is not None:
-        data = pd.read_csv(io.BytesIO(file_bytes))
-    else:
-        data = generate_default_data()
-
-    target_col = 'price'
-    if target_col not in data.columns:
-        return None, None, None, None, None, data
-
-    X = data.drop(columns=[target_col])
-    y = data[target_col]
-
-    # Log Transformation
-    y_log = np.log1p(y)
-
-    # Feature Engineering
-    X_fe = create_features(X)
-
-    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
-
+def build_pipeline(num_cols, cat_cols):
+    """Pipeline mimarisini oluşturur."""
     numeric_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', RobustScaler())
@@ -102,10 +81,73 @@ def train_model_cached(file_bytes, file_name):
         ]
     )
 
-    base_pipeline = Pipeline(steps=[
+    return Pipeline(steps=[
         ('preprocessor', preprocessor),
         ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
+
+@st.cache_resource(show_spinner="1/2: Tüm veri ile Feature Importance hesaplanıyor...")
+def get_top_4_features(data):
+    """1. AŞAMA: Tüm değişkenlerle ön modeli eğitip en önemli 4 değişkeni bulur."""
+    X = data.drop(columns=['price'])
+    y = np.log1p(data['price'])
+
+    X_fe = create_features(X)
+
+    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    pipeline = build_pipeline(num_cols, cat_cols)
+    pipeline.fit(X_fe, y)
+
+    # Feature Importance Okuma
+    importances = pipeline.named_steps['model'].feature_importances_
+    ohe_cat_cols = list(pipeline.named_steps['preprocessor']
+                        .named_transformers_['cat']
+                        .named_steps['onehot']
+                        .get_feature_names_out(cat_cols))
+    all_transformed_cols = num_cols + ohe_cat_cols
+
+    col_importance_map = {}
+    for col, imp in zip(all_transformed_cols, importances):
+        orig_col = col.split('_')[0] if '_' in col and col not in X.columns else col
+        if orig_col in X.columns:
+            col_importance_map[orig_col] = col_importance_map.get(orig_col, 0) + imp
+
+    # En yüksek öneme sahip ilk 4 orijinal değişken
+    sorted_features = sorted(col_importance_map.items(), key=lambda x: x[1], reverse=True)
+    top_4 = [item[0] for item in sorted_features[:4]]
+    return top_4
+
+@st.cache_resource(show_spinner="2/2: Sadece en önemli 4 değişken ile yeni model eğitiliyor...")
+def train_model_with_top_4(file_bytes, file_name):
+    """2. AŞAMA: Diğer tüm değişkenleri veri setinden çıkartıp sadece 4 değişkenle modeli kurar."""
+    if file_bytes is not None:
+        raw_data = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        raw_data = generate_default_data()
+
+    if 'price' not in raw_data.columns:
+        return None, None, None, None, None, raw_data
+
+    # En önemli 4 değişkeni tespit et
+    top_4_features = get_top_4_features(raw_data)
+
+    # Diğer tüm değişkenleri veri setinden ÇIKART
+    selected_cols = top_4_features + ['price']
+    filtered_df = raw_data[selected_cols].copy()
+
+    X = filtered_df.drop(columns=['price'])
+    y = filtered_df['price']
+    y_log = np.log1p(y)
+
+    # Türetilmiş özellikleri sadece bu 4 değişken üzerinden yap
+    X_fe = create_features(X)
+
+    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    base_pipeline = build_pipeline(num_cols, cat_cols)
 
     param_distributions = {
         'model__n_estimators': [100, 200, 300],
@@ -121,7 +163,7 @@ def train_model_cached(file_bytes, file_name):
     X_train, X_test, y_train_log, y_test_log, y_train_orig, y_test_orig = train_test_split(
         X_fe, y_log, y, test_size=0.2, random_state=42
     )
-    
+
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
     search = RandomizedSearchCV(
@@ -136,43 +178,24 @@ def train_model_cached(file_bytes, file_name):
     )
 
     search.fit(X_train, y_train_log)
-    best_pipeline = search.best_estimator_
+    final_pipeline = search.best_estimator_
 
-    # Feature Importance Hesaplama ve Orijinal Sütunlara İndirgeme
-    ohe_cat_cols = list(best_pipeline.named_steps['preprocessor']
-                        .named_transformers_['cat']
-                        .named_steps['onehot']
-                        .get_feature_names_out(cat_cols))
-    
-    all_transformed_cols = num_cols + ohe_cat_cols
-    importances = best_pipeline.named_steps['model'].feature_importances_
-
-    col_importance_map = {}
-    for col, imp in zip(all_transformed_cols, importances):
-        # OneHot sütun adlarını ham sütun adına eşle
-        orig_col = col.split('_')[0] if '_' in col and col not in X.columns else col
-        if orig_col in X.columns:
-            col_importance_map[orig_col] = col_importance_map.get(orig_col, 0) + imp
-
-    # En yüksek 4 öneme sahip orijinal sütunu seç
-    sorted_features = sorted(col_importance_map.items(), key=lambda x: x[1], reverse=True)
-    top_4_features = [item[0] for item in sorted_features[:4]]
-
-    y_pred_log = best_pipeline.predict(X_test)
+    y_pred_log = final_pipeline.predict(X_test)
     y_pred_orig = np.expm1(y_pred_log)
 
     test_mae = mean_absolute_error(y_test_orig, y_pred_orig)
     test_mape = mean_absolute_percentage_error(y_test_orig, y_pred_orig) * 100
     test_r2 = r2_score(y_test_orig, y_pred_orig)
 
-    return best_pipeline, test_mae, test_mape, test_r2, top_4_features, data
+    return final_pipeline, test_mae, test_mape, test_r2, top_4_features, filtered_df
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ (FEATURE IMPORTANCE 'A GÖRE DİNAMİK GİRDİ)
+# 2. STREAMLIT ARAYÜZÜ
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("Feature Importance (Öznitelik Önemi) Analizine Göre En Önemli 4 Değişkenle Tahmin")
+st.caption("Gereksiz Sütunlar Çıkarıldı: Yalnızca En Önemli 4 Değişken ile Yeniden Eğitilen Model")
 
+# YAN MENÜ: CSV Yükleme
 with st.sidebar:
     st.header("📁 Veri Seti Ayarları")
     uploaded_file = st.file_uploader("Kendi CSV Dosyanızı Yükleyin", type=["csv"])
@@ -180,13 +203,14 @@ with st.sidebar:
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         file_name = uploaded_file.name
-        st.success(f"✅ `{file_name}` aktif.")
+        st.success(f"✅ `{file_name}` yüklendi.")
     else:
         file_bytes = None
         file_name = "default_data.csv"
         st.info("💡 Varsayılan veri seti kullanılmaktadır.")
 
-best_model, test_mae, test_mape, test_r2, top_4_features, raw_df = train_model_cached(file_bytes, file_name)
+# SADECE 4 DEĞİŞKENLİ MODELİ EĞİT
+best_model, test_mae, test_mape, test_r2, top_4_features, filtered_df = train_model_with_top_4(file_bytes, file_name)
 
 st.divider()
 
@@ -194,46 +218,34 @@ if best_model is not None:
     col_input, col_result = st.columns([1, 1], gap="large")
 
     with col_input:
-        st.subheader("🎯 Model Tarafından Seçilen En Önemli 4 Değişken")
-        st.info(f"Modelin en çok önem verdiği değişkenler tespit edildi: **{', '.join(top_4_features)}**")
+        st.subheader("📋 Modelin Eğitildiği En Önemli 4 Değişken")
+        st.success(f"Geriye kalan tüm sütunlar çıkarıldı. Model sadece şu 4 sütun ile kuruldu: **{', '.join(top_4_features)}**")
 
         user_inputs = {}
-        all_x_cols = [c for c in raw_df.columns if c != 'price']
-
-        # En önemli 4 değişken için dinamik giriş kutusu oluştur
         for col in top_4_features:
-            if raw_df[col].dtype in ['int64', 'float64']:
-                min_v = float(raw_df[col].min())
-                max_v = float(raw_df[col].max())
-                median_v = float(raw_df[col].median())
-                user_inputs[col] = st.number_input(f"{col.upper()}", min_value=0.0, value=median_v)
+            if filtered_df[col].dtype in ['int64', 'float64']:
+                min_v = float(filtered_df[col].min())
+                max_v = float(filtered_df[col].max())
+                median_v = float(filtered_df[col].median())
+                user_inputs[col] = st.number_input(
+                    f"{col.upper()} (Min: {min_v:,.0f} - Max: {max_v:,.0f})", 
+                    min_value=0.0, 
+                    value=median_v
+                )
             else:
-                unique_vals = list(raw_df[col].dropna().unique())
+                unique_vals = list(filtered_df[col].dropna().unique())
                 user_inputs[col] = st.selectbox(f"{col.upper()}", options=unique_vals)
-
-        # Diğer değişkenleri veri setinin mod/medyan değerleriyle doldur
-        default_inputs = {}
-        for col in all_x_cols:
-            if col not in top_4_features:
-                if raw_df[col].dtype in ['int64', 'float64']:
-                    default_inputs[col] = raw_df[col].median()
-                else:
-                    default_inputs[col] = raw_df[col].mode()[0]
-
-        with st.expander("⚙️ Varsayılan Atanan Diğer Değişken Değerleri"):
-            st.json(default_inputs)
 
         predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
     with col_result:
-        st.subheader("📊 Tahmin Sonucu ve Model Hata Analizi")
+        st.subheader("📊 Tahmin Sonucu ve 4 Değişkenli Model Performansı")
         
         if predict_btn:
-            # Kullanıcı girdileri ile varsayılan girdileri birleştir
-            full_input = {**user_inputs, **default_inputs}
-            raw_input = pd.DataFrame([full_input])
-            
+            # Doğrudan sadece bu 4 değişkeni içeren DataFrame oluşturulur (Eksik sütun hatası vermez)
+            raw_input = pd.DataFrame([user_inputs])
             processed_input = create_features(raw_input)
+            
             pred_log = best_model.predict(processed_input)[0]
             pred_price = np.expm1(pred_log)
 
@@ -241,11 +253,18 @@ if best_model is not None:
             st.metric(label="Tahmini Piyasa Değeri", value=f"{pred_price:,.2f} TL")
 
             st.warning(
-                f"📢 **Model Bilgisi:**\n\n"
-                f"- Veri seti hata payı (MAPE): **%{test_mape:.2f}**\n"
-                f"- Ortalama Sapma (MAE): **±{test_mae:,.2f} TL**"
+                f"📢 **4 Değişkenli Model Bilgileri:**\n\n"
+                f"- Model sadece 4 ana değişkene dayalı eğitildiği için ortalama hata payı: **%{test_mape:.2f}**\n"
+                f"- Ortalama Sapma Miktarı (MAE): **±{test_mae:,.2f} TL**"
             )
 
+            st.divider()
+
             m1, m2 = st.columns(2)
-            m1.metric("MAPE Hata Oranı", f"%{test_mape:.2f}")
-            m2.metric("R² Başarı Skoru", f"%{test_r2 * 100:.1f}")
+            m1.metric("Model Yüzdesel Hatalılık (MAPE)", f"%{test_mape:.2f}")
+            m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
+
+        else:
+            st.info("Sol taraftan 4 özelliği girip **'Fiyatı Tahmin Et'** butonuna basınız.")
+else:
+    st.error("Veri setinizde 'price' sütunu bulunamadı. Lütfen 'price' sütununu içeren geçerli bir CSV yükleyin.")
