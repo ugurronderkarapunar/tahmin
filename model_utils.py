@@ -21,6 +21,7 @@ NUM_ENGINEERED = [
 ]
 ALL_NUM_COLS = NUM_BASE + NUM_ENGINEERED
 
+
 def create_features(df):
     X = df.copy()
     eps = 1e-6
@@ -30,6 +31,7 @@ def create_features(df):
     X["bath_per_bed_ratio"] = X["bathrooms"] / (X["bedrooms"] + eps)
     X["area_per_story"] = X["area"] / (X["stories"] + eps)
     return X
+
 
 def build_prep_pipeline():
     num_pipeline = Pipeline([
