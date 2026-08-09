@@ -90,7 +90,7 @@ def train_and_optimize_model():
         ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
 
-    # Hiperparametre Dağılımı
+    # Hiperparametre Dağılımı (MAE Odaklı)
     param_distributions = {
         'model__n_estimators': [100, 200, 300],
         'model__learning_rate': [0.01, 0.05, 0.1],
@@ -105,7 +105,7 @@ def train_and_optimize_model():
     X_train, X_test, y_train, y_test = train_test_split(X_fe, y, test_size=0.2, random_state=42)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    # MAE Skoruna göre Hiperparametre Arama
+    # MAE Skoruna Göre Hiperparametre Arama
     search = RandomizedSearchCV(
         estimator=base_pipeline,
         param_distributions=param_distributions,
@@ -119,7 +119,6 @@ def train_and_optimize_model():
 
     search.fit(X_train, y_train)
 
-    # En İyi MAE Skoruna Sahip Model
     best_pipeline = search.best_estimator_
     best_cv_mae = -search.best_score_
     best_params = search.best_params_
@@ -135,10 +134,10 @@ def train_and_optimize_model():
 best_model, best_cv_mae, test_mae, test_r2, best_params = train_and_optimize_model()
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ
+# 2. STREAMLIT ARAYÜZÜ (SERBEST SAYISAL GİRDİ ALANLARI)
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("5-Fold Cross Validation & MAE Hiperparametre Optimizasyonu ile Eğitilmiş Model")
+st.caption("5-Fold CV & MAE Hiperparametre Optimizasyonu Yapılmış En İyi Model")
 
 st.divider()
 
@@ -147,21 +146,50 @@ col_input, col_result = st.columns([1, 1], gap="large")
 with col_input:
     st.subheader("📋 Ev Özelliklerini Giriniz")
     
-    area = st.number_input("Metrekare / Alan (sqft)", min_value=500, max_value=20000, value=3500, step=100)
+    # Herhangi bir sayısal değer girilebilen serbest input alanları
+    area = st.number_input(
+        "Metrekare / Alan (sqft)", 
+        min_value=1.0, 
+        value=3500.0, 
+        step=50.0,
+        help="İstediğiniz herhangi bir metrekare değerini elle yazabilirsiniz."
+    )
     
     col_a, col_b = st.columns(2)
     with col_a:
-        bedrooms = st.selectbox("Yatak Odası Sayısı", options=[1, 2, 3, 4, 5, 6], index=2)
-        stories = st.selectbox("Kat Sayısı", options=[1, 2, 3, 4], index=1)
+        bedrooms = st.number_input(
+            "Yatak Odası Sayısı", 
+            min_value=0, 
+            value=3, 
+            step=1,
+            help="İstediğiniz oda sayısını giriniz."
+        )
+        stories = st.number_input(
+            "Kat Sayısı", 
+            min_value=0, 
+            value=2, 
+            step=1,
+            help="İstediğiniz kat sayısını giriniz."
+        )
     with col_b:
-        bathrooms = st.selectbox("Banyo Sayısı", options=[1, 2, 3, 4], index=1)
-        furnishingstatus = st.selectbox("Eşya Durumu", options=['furnished', 'semi-furnished', 'unfurnished'], index=1)
+        bathrooms = st.number_input(
+            "Banyo Sayısı", 
+            min_value=0, 
+            value=2, 
+            step=1,
+            help="İstediğiniz banyo sayısını giriniz."
+        )
+        furnishingstatus = st.selectbox(
+            "Eşya Durumu", 
+            options=['furnished', 'semi-furnished', 'unfurnished'], 
+            index=1
+        )
 
     col_c, col_d = st.columns(2)
     with col_c:
         mainroad = st.radio("Ana Yola Cepheli mi?", options=['yes', 'no'], index=0, horizontal=True)
     with col_d:
-        prefarea = st.radio("Preprestijli Bölgede mi?", options=['yes', 'no'], index=1, horizontal=True)
+        prefarea = st.radio("Prestijli Bölgede mi?", options=['yes', 'no'], index=1, horizontal=True)
 
     predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
@@ -170,16 +198,19 @@ with col_result:
     
     if predict_btn:
         raw_input = pd.DataFrame([{
-            'area': area,
-            'bedrooms': bedrooms,
-            'bathrooms': bathrooms,
-            'stories': stories,
+            'area': float(area),
+            'bedrooms': int(bedrooms),
+            'bathrooms': int(bathrooms),
+            'stories': int(stories),
             'mainroad': mainroad,
             'prefarea': prefarea,
             'furnishingstatus': furnishingstatus
         }])
         
+        # Otomatik Feature Engineering
         processed_input = create_features(raw_input)
+        
+        # En iyi model ile tahmin alma
         pred_price = best_model.predict(processed_input)[0]
         
         st.success("Tahmin Başarıyla Hesaplandı!")
@@ -199,4 +230,4 @@ with col_result:
             clean_params = {k.replace('model__', ''): v for k, v in best_params.items()}
             st.json(clean_params)
     else:
-        st.info("Tahmin sonucunu ve hiperparametre performans detaylarını görmek için **'Fiyatı Tahmin Et'** butonuna basınız.")
+        st.info("İstediğiniz sayısal değerleri girip **'Fiyatı Tahmin Et'** butonuna basarak anlık tahmin alabilirsiniz.")
