@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -18,7 +19,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & MODEL EĞİTİMİ
+# 1. YARDIMCI FONKSİYONLAR & TEK SEFERLİK EĞİTİM (CACHED)
 # ==============================================================================
 def create_features(df):
     """Girdilerden türetilmiş yeni özellikleri hesaplar."""
@@ -31,19 +32,47 @@ def create_features(df):
         df['area_per_story'] = df['area'] / (df['stories'] + 1e-5)
     return df
 
-@st.cache_resource
-def train_model_from_df(data_df):
-    """
-    Kullanıcının yüklediği veya varsayılan DataFrame üzerinden
-    Log Transformation + 5-Fold CV ile LightGBM modelini eğitir.
-    """
-    data = data_df.copy()
-    
-    # Hedef Değişken ve Öznitelik Ayrımı
+def generate_default_data():
+    """CSV yüklenmediğinde kullanılacak varsayılan veri kümesi."""
+    np.random.seed(42)
+    n_samples = 1000
+    data = pd.DataFrame({
+        'area': np.random.randint(1000, 15000, size=n_samples),
+        'bedrooms': np.random.randint(1, 8, size=n_samples),
+        'bathrooms': np.random.randint(1, 6, size=n_samples),
+        'stories': np.random.randint(1, 5, size=n_samples),
+        'mainroad': np.random.choice(['yes', 'no'], size=n_samples),
+        'guestroom': np.random.choice(['yes', 'no'], size=n_samples),
+        'basement': np.random.choice(['yes', 'no'], size=n_samples),
+        'hotwaterheating': np.random.choice(['yes', 'no'], size=n_samples),
+        'airconditioning': np.random.choice(['yes', 'no'], size=n_samples),
+        'parking': np.random.randint(0, 4, size=n_samples),
+        'prefarea': np.random.choice(['yes', 'no'], size=n_samples),
+        'furnishingstatus': np.random.choice(['furnished', 'semi-furnished', 'unfurnished'], size=n_samples),
+    })
+    base_price = (
+        data['area'] * 850 + 
+        (data['area'] ** 1.15) * 50 + 
+        data['bedrooms'] * 400000 + 
+        data['bathrooms'] * 800000 + 
+        (data['prefarea'] == 'yes') * 2500000 + 
+        (data['mainroad'] == 'yes') * 1000000
+    )
+    noise = np.random.normal(0, base_price * 0.08, size=n_samples)
+    data['price'] = np.maximum(500000, base_price + noise)
+    return data
+
+@st.cache_resource(show_spinner="Model eğitiliyor ve en iyi hiperparametreler optimize ediliyor (Lütfen bekleyiniz...)...")
+def train_model_cached(file_bytes, file_name):
+    """Yüklenen CSV'ye göre modeli eğitir ve önbelleğe alır."""
+    if file_bytes is not None:
+        data = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        data = generate_default_data()
+
     target_col = 'price'
     if target_col not in data.columns:
-        st.error(f"Veri setinizde '{target_col}' sütunu bulunamadı!")
-        return None, None, None, None
+        return None, None, None, None, data
 
     X = data.drop(columns=[target_col])
     y = data[target_col]
@@ -117,54 +146,30 @@ def train_model_from_df(data_df):
     test_mape = mean_absolute_percentage_error(y_test_orig, y_pred_orig) * 100
     test_r2 = r2_score(y_test_orig, y_pred_orig)
 
-    return best_pipeline, test_mae, test_mape, test_r2
-
-def generate_default_data():
-    """CSV yüklenmediğinde kullanılacak varsayılan veri kümesi."""
-    np.random.seed(42)
-    n_samples = 1000
-    data = pd.DataFrame({
-        'area': np.random.randint(1000, 15000, size=n_samples),
-        'bedrooms': np.random.randint(1, 8, size=n_samples),
-        'bathrooms': np.random.randint(1, 6, size=n_samples),
-        'stories': np.random.randint(1, 5, size=n_samples),
-        'mainroad': np.random.choice(['yes', 'no'], size=n_samples),
-        'prefarea': np.random.choice(['yes', 'no'], size=n_samples),
-        'furnishingstatus': np.random.choice(['furnished', 'semi-furnished', 'unfurnished'], size=n_samples),
-    })
-    base_price = (
-        data['area'] * 850 + 
-        (data['area'] ** 1.15) * 50 + 
-        data['bedrooms'] * 400000 + 
-        data['bathrooms'] * 800000 + 
-        (data['prefarea'] == 'yes') * 2500000 + 
-        (data['mainroad'] == 'yes') * 1000000
-    )
-    noise = np.random.normal(0, base_price * 0.08, size=n_samples)
-    data['price'] = np.maximum(500000, base_price + noise)
-    return data
+    return best_pipeline, test_mae, test_mape, test_r2, data
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ (CSV YÜKLEME VE TAHMİN)
+# 2. STREAMLIT ARAYÜZÜ (SADECE 4 ANA GİRDİ ALINIR)
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("Gerçek CSV Verisi ile Model Eğitimi ve Tahmin Arayüzü")
+st.caption("Kullanıcı Tarafından Sadece En Önemli 4 Değişken Girilerek Yapılan Tahmin")
 
-# YAN MENÜ: CSV Yükleme Seçeneği
+# YAN MENÜ: CSV Yükleme
 with st.sidebar:
     st.header("📁 Veri Seti Ayarları")
     uploaded_file = st.file_uploader("Kendi CSV Dosyanızı Yükleyin", type=["csv"])
     
     if uploaded_file is not None:
-        raw_df = pd.read_csv(uploaded_file)
-        st.success("✅ Kendi CSV dosyanız başarıyla yüklendi!")
-        st.write(f"**Toplam Satır Sayısı:** {len(raw_df)}")
+        file_bytes = uploaded_file.getvalue()
+        file_name = uploaded_file.name
+        st.success(f"✅ `{file_name}` aktif.")
     else:
-        st.info("💡 Hızlı test için varsayılan veri seti kullanılmaktadır. Kendi `.csv` dosyanızı yükleyebilirsiniz.")
-        raw_df = generate_default_data()
+        file_bytes = None
+        file_name = "default_data.csv"
+        st.info("💡 Varsayılan veri seti kullanılmaktadır.")
 
-# Modeli seçilen DataFrame üzerinden eğit
-best_model, test_mae, test_mape, test_r2 = train_model_from_df(raw_df)
+# MODELİ YÜKLE
+best_model, test_mae, test_mape, test_r2, raw_df = train_model_cached(file_bytes, file_name)
 
 st.divider()
 
@@ -172,23 +177,25 @@ if best_model is not None:
     col_input, col_result = st.columns([1, 1], gap="large")
 
     with col_input:
-        st.subheader("📋 Tahmin Edilecek Ev Özellikleri")
+        st.subheader("📋 Temel Ev Özellikleri (En Önemli 4 Girdi)")
         
-        area = st.number_input("Metrekare / Alan (sqft)", min_value=1.0, value=3500.0, step=50.0)
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            bedrooms = st.number_input("Yatak Odası Sayısı", min_value=0, value=3, step=1)
-            stories = st.number_input("Kat Sayısı", min_value=0, value=2, step=1)
-        with col_b:
-            bathrooms = st.number_input("Banyo Sayısı", min_value=0, value=2, step=1)
-            furnishingstatus = st.selectbox("Eşya Durumu", options=['furnished', 'semi-furnished', 'unfurnished'], index=1)
+        # Kullanıcıdan sadece bu 4 değişken alınıyor:
+        area = st.number_input("1. Metrekare / Alan (sqft)", min_value=1.0, value=3500.0, step=50.0)
+        bedrooms = st.number_input("2. Yatak Odası Sayısı", min_value=0, value=3, step=1)
+        bathrooms = st.number_input("3. Banyo Sayısı", min_value=0, value=2, step=1)
+        furnishingstatus = st.selectbox("4. Eşya Durumu", options=['furnished', 'semi-furnished', 'unfurnished'], index=1)
 
-        col_c, col_d = st.columns(2)
-        with col_c:
-            mainroad = st.radio("Ana Yola Cepheli mi?", options=['yes', 'no'], index=0, horizontal=True)
-        with col_d:
-            prefarea = st.radio("Prestijli Bölgede mi?", options=['yes', 'no'], index=1, horizontal=True)
+        # Gelişmiş seçeneklerin varsayılan bırakıldığını belirten bilgilendirme kutusu
+        with st.expander("⚙️ Varsayılan Atanan Diğer Özellikler (Opsiyonel)"):
+            st.caption("Kullanıcının girmediği diğer sütunlar otomatik varsayılan değerler ile doldurulur:")
+            st.write("- Kat Sayısı (stories): 1")
+            st.write("- Ana Yola Cephe (mainroad): 'yes'")
+            st.write("- Misafir Odası (guestroom): 'no'")
+            st.write("- Bodrum Kat (basement): 'no'")
+            st.write("- Sıcak Su Isıtma (hotwaterheating): 'no'")
+            st.write("- Klima (airconditioning): 'no'")
+            st.write("- Otopark Sayısı (parking): 0")
+            st.write("- Prestij Konum (prefarea): 'no'")
 
         predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
@@ -196,17 +203,29 @@ if best_model is not None:
         st.subheader("📊 Tahmin Sonucu ve Model Hata Analizi")
         
         if predict_btn:
+            # Modelin beklediği TÜM 12 değişkeni eksiksiz oluşturuyoruz
             raw_input = pd.DataFrame([{
+                # Kullanıcıdan Alınan 4 Temel Değişken
                 'area': float(area),
                 'bedrooms': int(bedrooms),
                 'bathrooms': int(bathrooms),
-                'stories': int(stories),
-                'mainroad': mainroad,
-                'prefarea': prefarea,
-                'furnishingstatus': furnishingstatus
+                'furnishingstatus': furnishingstatus,
+                
+                # Eksik Hata Vermemesi İçin Varsayılan Değerler
+                'stories': 1,
+                'mainroad': 'yes',
+                'guestroom': 'no',
+                'basement': 'no',
+                'hotwaterheating': 'no',
+                'airconditioning': 'no',
+                'parking': 0,
+                'prefarea': 'no'
             }])
             
+            # Türetilmiş özellikleri ekle
             processed_input = create_features(raw_input)
+            
+            # Tahmin Yap
             pred_log = best_model.predict(processed_input)[0]
             pred_price = np.expm1(pred_log)
             
@@ -216,14 +235,14 @@ if best_model is not None:
             st.success("Tahmin Başarıyla Üretildi!")
             
             st.metric(
-                label="Gerçek Veri Tabanlı Tahmini Piyasa Değeri",
+                label="Tahmini Piyasa Değeri",
                 value=f"{pred_price:,.2f} TL"
             )
 
             st.warning(
                 f"📢 **Model Güvenilirlik & Hata Bildirimi:**\n\n"
-                f"- Yüklenen veri seti üzerinde hesaplanan ortalama **%{test_mape:.2f} hata payı** vardır.\n"
-                f"- Yapılan tahminlerde ortalama sapma miktarı **±{test_mae:,.2f} TL**'dir.\n"
+                f"- Veri seti üzerindeki ortalama **%{test_mape:.2f} hata payı** ile hesaplanmıştır.\n"
+                f"- Sapma miktarı **±{test_mae:,.2f} TL**'dir.\n"
                 f"- **Olası Fiyat Aralığı:** `{lower_bound:,.0f} TL` — `{upper_bound:,.0f} TL`"
             )
 
@@ -234,4 +253,6 @@ if best_model is not None:
             m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
 
         else:
-            st.info("Sol menüden CSV yükleyebilir veya doğrudan **'Fiyatı Tahmin Et'** butonuna basarak tahmin alabilirsiniz.")
+            st.info("Sol taraftan 4 özelliği girip **'Fiyatı Tahmin Et'** butonuna basınız.")
+else:
+    st.error("Veri setinizde 'price' sütunu bulunamadı. Lütfen 'price' sütununu içeren geçerli bir CSV yükleyin.")
