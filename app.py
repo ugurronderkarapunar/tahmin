@@ -19,7 +19,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & 2 AŞAMALI MODEL EĞİTİMİ (CACHED)
+# 1. YARDIMCI FONKSİYONLAR & TAM MODEL EĞİTİMİ (CACHED)
 # ==============================================================================
 def create_features(df):
     """Girdilerden türetilmiş yeni özellikleri hesaplar."""
@@ -62,8 +62,28 @@ def generate_default_data():
     data['price'] = np.maximum(500000, base_price + noise)
     return data
 
-def build_pipeline(num_cols, cat_cols):
-    """Pipeline mimarisini oluşturur."""
+@st.cache_resource(show_spinner="Model tüm değişkenler ile eğitiliyor ve hiperparametreler optimize ediliyor...")
+def train_full_model(file_bytes, file_name):
+    """Veri setindeki TÜM değişkenleri kullanarak modeli eğitir."""
+    if file_bytes is not None:
+        raw_data = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        raw_data = generate_default_data()
+
+    target_col = 'price'
+    if target_col not in raw_data.columns:
+        return None, None, None, None, raw_data
+
+    X = raw_data.drop(columns=[target_col])
+    y = raw_data[target_col]
+    y_log = np.log1p(y)
+
+    # Feature Engineering
+    X_fe = create_features(X)
+
+    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
+
     numeric_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', RobustScaler())
@@ -81,73 +101,10 @@ def build_pipeline(num_cols, cat_cols):
         ]
     )
 
-    return Pipeline(steps=[
+    base_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor),
         ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
-
-@st.cache_resource(show_spinner="1/2: Tüm veri ile Feature Importance hesaplanıyor...")
-def get_top_4_features(data):
-    """1. AŞAMA: Tüm değişkenlerle ön modeli eğitip en önemli 4 değişkeni bulur."""
-    X = data.drop(columns=['price'])
-    y = np.log1p(data['price'])
-
-    X_fe = create_features(X)
-
-    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
-
-    pipeline = build_pipeline(num_cols, cat_cols)
-    pipeline.fit(X_fe, y)
-
-    # Feature Importance Okuma
-    importances = pipeline.named_steps['model'].feature_importances_
-    ohe_cat_cols = list(pipeline.named_steps['preprocessor']
-                        .named_transformers_['cat']
-                        .named_steps['onehot']
-                        .get_feature_names_out(cat_cols))
-    all_transformed_cols = num_cols + ohe_cat_cols
-
-    col_importance_map = {}
-    for col, imp in zip(all_transformed_cols, importances):
-        orig_col = col.split('_')[0] if '_' in col and col not in X.columns else col
-        if orig_col in X.columns:
-            col_importance_map[orig_col] = col_importance_map.get(orig_col, 0) + imp
-
-    # En yüksek öneme sahip ilk 4 orijinal değişken
-    sorted_features = sorted(col_importance_map.items(), key=lambda x: x[1], reverse=True)
-    top_4 = [item[0] for item in sorted_features[:4]]
-    return top_4
-
-@st.cache_resource(show_spinner="2/2: Sadece en önemli 4 değişken ile yeni model eğitiliyor...")
-def train_model_with_top_4(file_bytes, file_name):
-    """2. AŞAMA: Diğer tüm değişkenleri veri setinden çıkartıp sadece 4 değişkenle modeli kurar."""
-    if file_bytes is not None:
-        raw_data = pd.read_csv(io.BytesIO(file_bytes))
-    else:
-        raw_data = generate_default_data()
-
-    if 'price' not in raw_data.columns:
-        return None, None, None, None, None, raw_data
-
-    # En önemli 4 değişkeni tespit et
-    top_4_features = get_top_4_features(raw_data)
-
-    # Diğer tüm değişkenleri veri setinden ÇIKART
-    selected_cols = top_4_features + ['price']
-    filtered_df = raw_data[selected_cols].copy()
-
-    X = filtered_df.drop(columns=['price'])
-    y = filtered_df['price']
-    y_log = np.log1p(y)
-
-    # Türetilmiş özellikleri sadece bu 4 değişken üzerinden yap
-    X_fe = create_features(X)
-
-    num_cols = X_fe.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    cat_cols = X_fe.select_dtypes(include=['object', 'category']).columns.tolist()
-
-    base_pipeline = build_pipeline(num_cols, cat_cols)
 
     param_distributions = {
         'model__n_estimators': [100, 200, 300],
@@ -178,22 +135,22 @@ def train_model_with_top_4(file_bytes, file_name):
     )
 
     search.fit(X_train, y_train_log)
-    final_pipeline = search.best_estimator_
+    best_pipeline = search.best_estimator_
 
-    y_pred_log = final_pipeline.predict(X_test)
+    y_pred_log = best_pipeline.predict(X_test)
     y_pred_orig = np.expm1(y_pred_log)
 
     test_mae = mean_absolute_error(y_test_orig, y_pred_orig)
     test_mape = mean_absolute_percentage_error(y_test_orig, y_pred_orig) * 100
     test_r2 = r2_score(y_test_orig, y_pred_orig)
 
-    return final_pipeline, test_mae, test_mape, test_r2, top_4_features, filtered_df
+    return best_pipeline, test_mae, test_mape, test_r2, raw_data
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ
+# 2. STREAMLIT ARAYÜZÜ (TÜM GİRDİLER DİNAMİK OLARAK ALINIR)
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("Gereksiz Sütunlar Çıkarıldı: Yalnızca En Önemli 4 Değişken ile Yeniden Eğitilen Model")
+st.caption("Veri Setindeki Tüm Değişkenlerin Eksiksiz Kullanıldığı Tam Model")
 
 # YAN MENÜ: CSV Yükleme
 with st.sidebar:
@@ -203,59 +160,93 @@ with st.sidebar:
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
         file_name = uploaded_file.name
-        st.success(f"✅ `{file_name}` yüklendi.")
+        st.success(f"✅ `{file_name}` aktif.")
     else:
         file_bytes = None
         file_name = "default_data.csv"
         st.info("💡 Varsayılan veri seti kullanılmaktadır.")
 
-# SADECE 4 DEĞİŞKENLİ MODELİ EĞİT
-best_model, test_mae, test_mape, test_r2, top_4_features, filtered_df = train_model_with_top_4(file_bytes, file_name)
+best_model, test_mae, test_mape, test_r2, raw_df = train_full_model(file_bytes, file_name)
 
 st.divider()
 
 if best_model is not None:
-    col_input, col_result = st.columns([1, 1], gap="large")
+    col_input, col_result = st.columns([1.2, 0.8], gap="large")
 
     with col_input:
-        st.subheader("📋 Modelin Eğitildiği En Önemli 4 Değişken")
-        st.success(f"Geriye kalan tüm sütunlar çıkarıldı. Model sadece şu 4 sütun ile kuruldu: **{', '.join(top_4_features)}**")
+        st.subheader("📋 Ev Özellikleri (Tüm Değişkenler)")
+        st.caption("Tahmin başarısını artırmak için lütfen tüm özellikleri eksiksiz doldurunuz.")
+
+        # 'price' dışındaki tüm sütunları al
+        x_cols = [col for col in raw_df.columns if col != 'price']
 
         user_inputs = {}
-        for col in top_4_features:
-            if filtered_df[col].dtype in ['int64', 'float64']:
-                min_v = float(filtered_df[col].min())
-                max_v = float(filtered_df[col].max())
-                median_v = float(filtered_df[col].median())
-                user_inputs[col] = st.number_input(
-                    f"{col.upper()} (Min: {min_v:,.0f} - Max: {max_v:,.0f})", 
-                    min_value=0.0, 
-                    value=median_v
-                )
-            else:
-                unique_vals = list(filtered_df[col].dropna().unique())
-                user_inputs[col] = st.selectbox(f"{col.upper()}", options=unique_vals)
+        
+        # Giriş formunu düzgün düzenlemek için 2 alt sütuna bölüyoruz
+        sub_col1, sub_col2 = st.columns(2)
 
+        for idx, col in enumerate(x_cols):
+            target_sub = sub_col1 if idx % 2 == 0 else sub_col2
+            
+            if raw_df[col].dtype in ['int64', 'float64']:
+                min_val = float(raw_df[col].min())
+                max_val = float(raw_df[col].max())
+                median_val = float(raw_df[col].median())
+                
+                # Tam sayı veya kesirli sayı ayrımı
+                if raw_df[col].dtype == 'int64':
+                    user_inputs[col] = target_sub.number_input(
+                        f"{col.upper()}", 
+                        min_value=int(min_val), 
+                        max_value=int(max_val),
+                        value=int(median_val),
+                        step=1
+                    )
+                else:
+                    user_inputs[col] = target_sub.number_input(
+                        f"{col.upper()}", 
+                        min_value=0.0, 
+                        value=median_val
+                    )
+            else:
+                unique_options = list(raw_df[col].dropna().unique())
+                user_inputs[col] = target_sub.selectbox(
+                    f"{col.upper()}", 
+                    options=unique_options
+                )
+
+        st.write("")
         predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
     with col_result:
-        st.subheader("📊 Tahmin Sonucu ve 4 Değişkenli Model Performansı")
+        st.subheader("📊 Tahmin Sonucu ve Model Analizi")
         
         if predict_btn:
-            # Doğrudan sadece bu 4 değişkeni içeren DataFrame oluşturulur (Eksik sütun hatası vermez)
+            # Tüm girdileri içeren tek satırlık DataFrame oluştur
             raw_input = pd.DataFrame([user_inputs])
+            
+            # Türetilmiş özellikleri ekle
             processed_input = create_features(raw_input)
             
+            # Model Tahmini
             pred_log = best_model.predict(processed_input)[0]
             pred_price = np.expm1(pred_log)
 
+            lower_bound = max(0, pred_price - test_mae)
+            upper_bound = pred_price + test_mae
+
             st.success("Tahmin Başarıyla Üretildi!")
-            st.metric(label="Tahmini Piyasa Değeri", value=f"{pred_price:,.2f} TL")
+            
+            st.metric(
+                label="Tahmini Piyasa Değeri",
+                value=f"{pred_price:,.2f} TL"
+            )
 
             st.warning(
-                f"📢 **4 Değişkenli Model Bilgileri:**\n\n"
-                f"- Model sadece 4 ana değişkene dayalı eğitildiği için ortalama hata payı: **%{test_mape:.2f}**\n"
-                f"- Ortalama Sapma Miktarı (MAE): **±{test_mae:,.2f} TL**"
+                f"📢 **Tam Model Güvenilirlik Bilgisi:**\n\n"
+                f"- Model tüm konumsal ve donanımsal değişkenleri hesaba katmaktadır.\n"
+                f"- Veri seti geneli ortalama sapma (MAE): **±{test_mae:,.2f} TL**\n"
+                f"- **Olası Fiyat Aralığı:** `{lower_bound:,.0f} TL` — `{upper_bound:,.0f} TL`"
             )
 
             st.divider()
@@ -265,6 +256,6 @@ if best_model is not None:
             m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
 
         else:
-            st.info("Sol taraftan 4 özelliği girip **'Fiyatı Tahmin Et'** butonuna basınız.")
+            st.info("Sol taraftaki tüm ev özelliklerini seçip **'Fiyatı Tahmin Et'** butonuna basınız.")
 else:
     st.error("Veri setinizde 'price' sütunu bulunamadı. Lütfen 'price' sütununu içeren geçerli bir CSV yükleyin.")
