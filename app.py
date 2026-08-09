@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & HİPERPARAMETRE OPTİMİZASYONLU MODEL EĞİTİMİ
+# 1. YARDIMCI FONKSİYONLAR & LOG-TRANSFORM DESTEKLİ MODEL EĞİTİMİ
 # ==============================================================================
 def create_features(df):
     """Girdilerden türetilmiş yeni özellikleri hesaplar."""
@@ -31,10 +31,11 @@ def create_features(df):
 @st.cache_resource
 def train_and_optimize_model():
     """
-    1. Sentetik veriyi üretir.
-    2. Ön işleme pipeline'ını kurar.
-    3. RandomizedSearchCV (5-Fold CV) ile MAE skorunu en minimize eden hiperparametreleri bulur.
-    4. Model performans metriklerini (MAE, MAPE, R²) hesaplayıp döndürür.
+    1. Sentetik veri kümesi üretir.
+    2. Hedef değişkene Log Transformation (np.log1p) uygular.
+    3. Ön işleme pipeline'ını kurar.
+    4. RandomizedSearchCV (5-Fold CV) ile en iyi hiperparametreleri seçer.
+    5. Tahminleri ters dönüşümle (np.expm1) orijinal TL ölçeğine çevirip değerlendirir.
     """
     np.random.seed(42)
     n_samples = 600
@@ -60,6 +61,9 @@ def train_and_optimize_model():
 
     X = data.drop(columns=['price'])
     y = data['price']
+
+    # LOG TRANSFORMATION: Fiyat değişkeni logaritmik ölçeğe aktarılır
+    y_log = np.log1p(y)
 
     # Feature Engineering
     X_fe = create_features(X)
@@ -90,7 +94,7 @@ def train_and_optimize_model():
         ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
 
-    # Hiperparametre Arama
+    # Hiperparametre Arama Dağılımı
     param_distributions = {
         'model__n_estimators': [100, 200, 300],
         'model__learning_rate': [0.01, 0.05, 0.1],
@@ -102,9 +106,14 @@ def train_and_optimize_model():
         'model__reg_lambda': [0.0, 0.1, 1.0]
     }
 
-    X_train, X_test, y_train, y_test = train_test_split(X_fe, y, test_size=0.2, random_state=42)
+    # Train / Test Ayrımı (Orijinal y ve Log y)
+    X_train, X_test, y_train_log, y_test_log, y_train_orig, y_test_orig = train_test_split(
+        X_fe, y_log, y, test_size=0.2, random_state=42
+    )
+    
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
+    # Hiperparametre Optimizasyonu (Log Hedef Üzerinde)
     search = RandomizedSearchCV(
         estimator=base_pipeline,
         param_distributions=param_distributions,
@@ -116,15 +125,18 @@ def train_and_optimize_model():
         verbose=0
     )
 
-    search.fit(X_train, y_train)
+    search.fit(X_train, y_train_log)
 
     best_pipeline = search.best_estimator_
 
-    # Test Kümesi Üzerinde Hata Oranlarının Hesaplanması
-    y_pred_test = best_pipeline.predict(X_test)
-    test_mae = mean_absolute_error(y_test, y_pred_test)
-    test_mape = mean_absolute_percentage_error(y_test, y_pred_test) * 100
-    test_r2 = r2_score(y_test, y_pred_test)
+    # Test Kümesi Tahminleri & GERİ DÖNÜŞÜM (np.expm1)
+    y_pred_log = best_pipeline.predict(X_test)
+    y_pred_orig = np.expm1(y_pred_log)  # Logaritmik tahmini TL birimine geri çevirir
+
+    # Metriklerin Orijinal TL Üzerinden Hesaplanması
+    test_mae = mean_absolute_error(y_test_orig, y_pred_orig)
+    test_mape = mean_absolute_percentage_error(y_test_orig, y_pred_orig) * 100
+    test_r2 = r2_score(y_test_orig, y_pred_orig)
 
     return best_pipeline, test_mae, test_mape, test_r2
 
@@ -132,10 +144,10 @@ def train_and_optimize_model():
 best_model, test_mae, test_mape, test_r2 = train_and_optimize_model()
 
 # ==============================================================================
-# 2. STREAMLIT ARAYÜZÜ (HATA GERİ BİLDİRİMLİ)
+# 2. STREAMLIT ARAYÜZÜ (LOG-TRANSFORMED PREDICTION)
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.caption("5-Fold CV ile MAE Bazlı Optimize Edilmiş LightGBM Modeli")
+st.caption("Log Transformation (np.log1p) ve LightGBM ile Yüksek Fiyat Hassasiyetli Model")
 
 st.divider()
 
@@ -177,37 +189,43 @@ with col_result:
         }])
         
         processed_input = create_features(raw_input)
-        pred_price = best_model.predict(processed_input)[0]
         
-        # Tahmin Aralığı Hesaplama (Nokta Tahmin ± Ortalama Hata)
+        # 1. Log Ölçeğinde Tahmin Üret
+        pred_log = best_model.predict(processed_input)[0]
+        
+        # 2. Tahmini Orijinal TL Ölçeğine Çevir (np.expm1)
+        pred_price = np.expm1(pred_log)
+        
+        # Olası Aralık
         lower_bound = max(0, pred_price - test_mae)
         upper_bound = pred_price + test_mae
 
         st.success("Tahmin Başarıyla Üretildi!")
         
-        # Nokta Tahmin Gösterimi
+        # Nokta Tahmin
         st.metric(
-            label="Tahmini Piyasa Değeri",
+            label="Tahmini Piyasa Değeri (Log-Transformed Model)",
             value=f"{pred_price:,.2f} TL"
         )
 
-        # Kullanıcıya Özel Hata Oranı Bildirimi
+        # Hata Bildirimi
         st.warning(
             f"📢 **Model Güvenilirlik & Hata Bildirimi:**\n\n"
-            f"- Bu model test verileri üzerinde **%{test_mape:.2f} ortalama hata oranı** ile çalışmaktadır.\n"
+            f"- Model **Log Transformation** ile eğitildiği için yüksek fiyatlı ve uç değerdeki mülklerde daha kararlı sonuç verir.\n"
+            f"- Test kümesi genelinde ortalama **%{test_mape:.2f} hata payı** ile çalışmaktadır.\n"
             f"- Yapılan tahminlerde ortalama sapma miktarı **±{test_mae:,.2f} TL**'dir.\n"
             f"- **Olası Fiyat Aralığı:** `{lower_bound:,.0f} TL` — `{upper_bound:,.0f} TL`"
         )
 
         st.divider()
 
-        # Detaylı Performans Metrikleri
+        # Detaylı Metrikler
         m1, m2 = st.columns(2)
         m1.metric("Model Yüzdesel Hatalılık (MAPE)", f"%{test_mape:.2f}")
         m2.metric("Model Açıklayıcılık Oranı (R²)", f"%{test_r2 * 100:.1f}")
 
     else:
         st.info(
-            f"ℹ️ **Sistem Bilgisi:** Eğitilen model test verilerinde ortalama **%{test_mape:.2f}** hata payına sahiptir.\n\n"
+            f"ℹ️ **Sistem Bilgisi:** Model hedef değişkene `np.log1p` uygulanarak eğitilmiştir ve test kümesinde ortalama **%{test_mape:.2f}** hata payına sahiptir.\n\n"
             "Tahmin almak için soldaki form alanlarını doldurup **'Fiyatı Tahmin Et'** butonuna basınız."
         )
