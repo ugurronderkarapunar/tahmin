@@ -28,13 +28,28 @@ def load_data(uploaded_file):
 
 
 @st.cache_resource
-def load_saved_model():
+def get_or_train_default_model():
+    # 1. Hazır model.pkl varsa yüklemeyi dene
     if os.path.exists("model.pkl"):
         try:
             return joblib.load("model.pkl")
-        except Exception as e:
-            st.error(f"Model yüklenirken sürüm hatası oluştu: {e}")
-            return None
+        except Exception:
+            pass  # Sürüm uyumsuzluğu varsa yeniden eğitime geç
+
+    # 2. model.pkl yoksa veya hatalıysa, yerel Housing.csv üzerinden otomatik eğit
+    if os.path.exists("Housing.csv"):
+        df = pd.read_csv("Housing.csv")
+        X = df.drop(columns=["price"])
+        y_log = np.log1p(df["price"])
+
+        pipeline = Pipeline([
+            ("prep", build_prep_pipeline()),
+            ("model", LGBMRegressor(n_estimators=200, learning_rate=0.05, random_state=42, verbose=-1))
+        ])
+        pipeline.fit(X, y_log)
+        joblib.dump(pipeline, "model.pkl")
+        return pipeline
+
     return None
 
 
@@ -262,23 +277,15 @@ with tab3:
             ax.set_title("Fiyata Göre Hata")
             st.pyplot(fig)
 
-# TAB 4 - SADECE MODEL.PKL İLE ÇALIŞAN TAHMİN SEKMESİ
+# TAB 4 - TAHMİN SEKMESİ (CSV Yükleme Şartı Olmadan Çalışır)
 with tab4:
     st.subheader("Yeni Bir Ev İçin Fiyat Tahmini")
 
-    active_pipeline = load_saved_model()
-
-    if active_pipeline is None and data_available:
-        with st.spinner("model.pkl bulunamadı, yüklenen veriden model eğitiliyor..."):
-            _, fitted_pipelines, best_name = train_all_models(
-                X_train, y_train_model, X_test, y_test_model
-            )
-            active_pipeline = fitted_pipelines[best_name]
+    active_pipeline = get_or_train_default_model()
 
     if active_pipeline is None:
         st.error(
-            "Tahmin yapabilmek için `model.pkl` dosyasının dizinde bulunması gerekir. "
-            "Lütfen `python train_and_save.py` çalıştırarak modeli oluşturun."
+            "Tahmin yapabilmek için dizinde `Housing.csv` veya `model.pkl` dosyası bulunmalıdır."
         )
     else:
         c1, c2, c3 = st.columns(3)
