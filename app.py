@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import RobustScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. YARDIMCI FONKSİYONLAR & MODEL EĞİTİMİ (ÖNBELLEKLİ)
+# 1. YARDIMCI FONKSİYONLAR & HİPERPARAMETRE OPTİMİZASYONLU MODEL EĞİTİMİ
 # ==============================================================================
 def create_features(df):
     """Girdilerden türetilmiş yeni özellikleri hesaplar."""
@@ -29,8 +29,13 @@ def create_features(df):
     return df
 
 @st.cache_resource
-def train_model_pipeline():
-    """Veriyi üretir, pipeline'ı kurar ve modeli eğitir."""
+def train_and_optimize_model():
+    """
+    1. Sentetik veriyi üretir.
+    2. Ön işleme pipeline'ını kurar.
+    3. RandomizedSearchCV (5-Fold CV) ile MAE skorunu en minimize eden hiperparametreleri bulur.
+    4. En iyi modeli (best_estimator_) döndürür.
+    """
     np.random.seed(42)
     n_samples = 600
 
@@ -79,34 +84,61 @@ def train_model_pipeline():
         ]
     )
 
-    full_pipeline = Pipeline(steps=[
+    # Ana Pipeline
+    base_pipeline = Pipeline(steps=[
         ('preprocessor', preprocessor),
-        ('model', LGBMRegressor(
-            n_estimators=200,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            verbose=-1
-        ))
+        ('model', LGBMRegressor(random_state=42, verbose=-1))
     ])
 
+    # Hiperparametre Dağılımı
+    param_distributions = {
+        'model__n_estimators': [100, 200, 300],
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__max_depth': [3, 5, 7, -1],
+        'model__num_leaves': [15, 31, 63],
+        'model__subsample': [0.7, 0.8, 1.0],
+        'model__colsample_bytree': [0.7, 0.8, 1.0],
+        'model__reg_alpha': [0.0, 0.1, 1.0],
+        'model__reg_lambda': [0.0, 0.1, 1.0]
+    }
+
     X_train, X_test, y_train, y_test = train_test_split(X_fe, y, test_size=0.2, random_state=42)
-    full_pipeline.fit(X_train, y_train)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    y_pred = full_pipeline.predict(X_test)
-    mae = mean_absolute_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
+    # MAE Skoruna göre Hiperparametre Arama
+    search = RandomizedSearchCV(
+        estimator=base_pipeline,
+        param_distributions=param_distributions,
+        n_iter=15,
+        cv=kf,
+        scoring='neg_mean_absolute_error',
+        random_state=42,
+        n_jobs=-1,
+        verbose=0
+    )
 
-    return full_pipeline, mae, r2
+    search.fit(X_train, y_train)
 
-# Modeli Eğit / Yükle
-pipeline, model_mae, model_r2 = train_model_pipeline()
+    # En İyi MAE Skoruna Sahip Model
+    best_pipeline = search.best_estimator_
+    best_cv_mae = -search.best_score_
+    best_params = search.best_params_
+
+    # Test Kümesi Performansı
+    y_pred_test = best_pipeline.predict(X_test)
+    test_mae = mean_absolute_error(y_test, y_pred_test)
+    test_r2 = r2_score(y_test, y_pred_test)
+
+    return best_pipeline, best_cv_mae, test_mae, test_r2, best_params
+
+# En iyi modeli oluştur ve önbelleğe al
+best_model, best_cv_mae, test_mae, test_r2, best_params = train_and_optimize_model()
 
 # ==============================================================================
 # 2. STREAMLIT ARAYÜZÜ
 # ==============================================================================
 st.title("🏠 Yapay Zekâ Destekli Ev Fiyat Tahmin Paneli")
-st.markdown("Evin temel özelliklerini seçerek tahmini piyasa değerini hesaplayabilirsiniz.")
+st.caption("5-Fold Cross Validation & MAE Hiperparametre Optimizasyonu ile Eğitilmiş Model")
 
 st.divider()
 
@@ -129,15 +161,14 @@ with col_input:
     with col_c:
         mainroad = st.radio("Ana Yola Cepheli mi?", options=['yes', 'no'], index=0, horizontal=True)
     with col_d:
-        prefarea = st.radio("Presti̇jli Bölgede mi?", options=['yes', 'no'], index=1, horizontal=True)
+        prefarea = st.radio("Preprestijli Bölgede mi?", options=['yes', 'no'], index=1, horizontal=True)
 
     predict_btn = st.button("🔮 Fiyatı Tahmin Et", type="primary", use_container_width=True)
 
 with col_result:
-    st.subheader("📊 Tahmin Sonucu")
+    st.subheader("📊 Tahmin ve Model Performansı")
     
     if predict_btn:
-        # Ham veri çerçevesi oluşturma
         raw_input = pd.DataFrame([{
             'area': area,
             'bedrooms': bedrooms,
@@ -148,22 +179,24 @@ with col_result:
             'furnishingstatus': furnishingstatus
         }])
         
-        # Otomatik Feature Engineering
         processed_input = create_features(raw_input)
-        
-        # Tahmin
-        pred_price = pipeline.predict(processed_input)[0]
+        pred_price = best_model.predict(processed_input)[0]
         
         st.success("Tahmin Başarıyla Hesaplandı!")
         st.metric(
-            label="Tahmini Ev Fiyatı",
+            label="En İyi Modelin Tahmin Ettiği Ev Fiyatı",
             value=f"{pred_price:,.2f} TL"
         )
         
-        st.info(
-            f"**Model Performans Bi̇lgi̇si̇:**\n"
-            f"- **Ortalama Hata (MAE):** ±{model_mae:,.2f} TL\n"
-            f"- **Açıklayıcılık Oranı (R²):** %{model_r2 * 100:.1f}"
-        )
+        st.divider()
+        st.markdown("### 🎯 Optimizasyon Metrikleri")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("En İyi CV MAE", f"±{best_cv_mae:,.0f} TL")
+        m2.metric("Test MAE", f"±{test_mae:,.0f} TL")
+        m3.metric("Test R²", f"%{test_r2 * 100:.1f}")
+
+        with st.expander("🛠️ Seçilen En İyi Hiperparametreler (Best Parameters)"):
+            clean_params = {k.replace('model__', ''): v for k, v in best_params.items()}
+            st.json(clean_params)
     else:
-        st.info("Tahmin sonucunu görmek için sol taraftaki değerleri ayarlayıp **'Fiyatı Tahmin Et'** butonuna basınız.")
+        st.info("Tahmin sonucunu ve hiperparametre performans detaylarını görmek için **'Fiyatı Tahmin Et'** butonuna basınız.")
